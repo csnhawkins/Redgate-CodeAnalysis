@@ -60,14 +60,17 @@ Two things the built-in library does not do, which is why the custom rules exist
 
 ## 3. How the pieces fit together
 
-Four artifacts, all of which live in your repository:
+The whole thing is one self-contained folder, `code-review-rules/`, meant to be dropped into `flyway.toml`'s `check.sqlfluffCustomRulesPath` as-is — see [section 10](#10-keeping-central-control) for pulling it into multiple product repositories as a single shared, read-only source rather than copy-pasting it. Inside that folder:
 
-- `code-review-rules/rules.py` — the two rules. Written once, then left alone.
-- `code-review-rules/pii-objects.json` — **the list of tables, objects and columns to watch. Yours to maintain, and the only file that changes regularly.**
-- `sqlfluff.cfg` — which rules are active and at what severity.
-- `flyway.toml` — points Flyway at the other three.
+- `code-review-rules/rules/_shared.py` — generic manifest loading and parse-tree helpers. No knowledge of PII or any other specific concern lives here — written once, then left alone.
+- `code-review-rules/rules/pii.py` — the two PII rules, built on top of `_shared.py`.
+- `code-review-rules/manifests/pii.json` — **the list of tables, objects and columns to watch. Yours to maintain, and the only file that changes regularly.**
+- `code-review-rules/docs/pii.md` — the plain-English "what does this rule do" page for PI01/PI02.
+- `code-review-rules/sqlfluff.cfg` — which rules are active and at what severity.
+- `code-review-rules/README.md` — the index of every rule module in the folder, and the checklist for adding another one.
+- `flyway.toml` — points Flyway at `code-review-rules/` and its `sqlfluff.cfg`.
 
-The split matters more than any individual piece. All the Flyway-specific and SQL-parsing work sits in `rules.py`, and everything about *your* classification sits in a JSON file your team owns. Adding a newly tagged column is a one-line change to data, reviewed in a pull request, with no code change and no re-testing of the rules.
+The split matters more than any individual piece. All the Flyway-specific and SQL-parsing work sits in `rules/`, and everything about *your* classification sits in a JSON file your team owns. Adding a newly tagged column is a one-line change to data, reviewed in a pull request, with no code change and no re-testing of the rules. This also means the package can grow to cover other compliance concerns over time — a "financial tables" rule or a "naming convention" rule slots in as its own `rules/<concern>.py` + `manifests/<concern>.json` pair, without touching the PII rules at all. `code-review-rules/README.md` has the step-by-step for adding one.
 
 The rules are:
 
@@ -93,14 +96,14 @@ The code was written against the documented SQLFluff plugin API and verified on 
 `code-review-rules/__init__.py`:
 
 ```python
-"""Custom Flyway code review rules for PII."""
+"""Custom Flyway code review rules - plugin entry point."""
 
 from sqlfluff.core.plugin import hookimpl
 
 
 @hookimpl
 def get_rules():
-    from .rules import Rule_PI01, Rule_PI02
+    from .rules.pii import Rule_PI01, Rule_PI02
     return [Rule_PI01, Rule_PI02]
 ```
 
@@ -109,9 +112,11 @@ Two things about this file matter, and both will break the package if changed:
 - The rule imports happen **inside** `get_rules()`, not at module top level. The package has to finish loading before SQLFluff's metaclass inspects the rule classes.
 - There is no `get_configs_info()` hook, because neither rule declares a SQLFluff config parameter. The manifest path is resolved from the package directory, or from the `PII_MANIFEST_PATH` environment variable if you need to override it. Plugin config plumbing has varied between SQLFluff releases, and taking it out of the picture removes a class of version-dependent failure.
 
+`__init__.py` only aggregates rule modules — it should never contain rule logic itself. As more compliance concerns are added, each gets its own `rules/<concern>.py` and an extra import line here. See `code-review-rules/README.md` for the checklist.
+
 ### The rule classes
 
-The full implementation is in `code-review-rules/rules.py`. The class declarations are the part worth reviewing:
+The full implementation is in `code-review-rules/rules/pii.py`, built on the generic parse-tree and manifest-loading helpers in `code-review-rules/rules/_shared.py`. The class declarations are the part worth reviewing:
 
 ```python
 class Rule_PI01(BaseRule):
@@ -152,7 +157,7 @@ The statement segment names above (`truncate_table`, `drop_table_statement`, `al
 
 ## 4. The PII manifest
 
-**This file is yours.** It is the whole point of the design: the rules carry no knowledge of which objects hold personal data, and the list of tables, objects and columns to watch lives in a plain JSON file your team owns and maintains. Changing what is protected is a change to this file, reviewed like any other change in your repository. It does not require touching `rules.py`, re-testing the rules, or coming back to Redgate.
+**This file (`code-review-rules/manifests/pii.json`) is yours.** It is the whole point of the design: the rules carry no knowledge of which objects hold personal data, and the list of tables, objects and columns to watch lives in a plain JSON file your team owns and maintains. Changing what is protected is a change to this file, reviewed like any other change in your repository. It does not require touching `rules/pii.py`, re-testing the rules, or coming back to Redgate.
 
 ```json
 {
@@ -212,7 +217,7 @@ An unqualified reference such as `UPDATE Customer SET ...` is matched on the tab
 ```toml
 [flyway.check]
 sqlfluffCustomRulesPath = "code-review-rules"
-rulesConfig = "sqlfluff.cfg"
+rulesConfig = "code-review-rules/sqlfluff.cfg"
 
 [flyway.check.code]
 failOnError = false
@@ -254,7 +259,7 @@ All Finished!
 exit code 0
 ```
 
-That is the failure mode to design against, and it is not really about the number. A compliance gate that returns success on a file it never read is worse than no gate, because someone will point at the green build as evidence. Asserting that `V001__pii_violations.sql` still reports 20 violations catches it regardless of where the ceiling sits, and catches several other ways the gate can quietly stop working at the same time. That assertion, not the limit, is the control on the control.
+That is the failure mode to design against, and it is not really about the number. A compliance gate that returns success on a file it never read is worse than no gate, because someone will point at the green build as evidence. Asserting that `V001__pii_violations.sql` still reports 20 `PI01`/`PI02` violations between them catches it regardless of where the ceiling sits, and catches several other ways the gate can quietly stop working at the same time. That assertion, not the limit, is the control on the control.
 
 If a genuine migration does exceed the ceiling, the answer is to split it rather than to remove the cap. Large migrations are worth splitting anyway, since a failure part-way through one is harder to reason about than a failure between two.
 
@@ -274,9 +279,9 @@ Custom rule violations are tagged `"ruleSource": "custom"` in the JSON and SARIF
 
 ## 6. Proving it works
 
-Two migrations ship in `test/`. Point a scratch Flyway project at them and run `flyway check -code`.
+Two migrations ship in `code-review-rules/tests/pii/`. No separate scratch Flyway project or migrations folder needed — point `check -code` at one script file directly: `flyway check -code -check.scope="script" -check.scriptFilename="code-review-rules/tests/pii/V001__pii_violations.sql"`. See `code-review-rules/tests/README.md` for both commands, verified real output, expected counts per domain, and how to pull the `PI01`/`PI02` count out of the JSON report.
 
-`test/V001__pii_violations.sql` — every statement should be reported. **20 violations.** Output below is verbatim from `sqlfluff lint` against the shipped package, manifest and config, on SQLFluff 3.4.0:
+`code-review-rules/tests/pii/V001__pii_violations.sql` — every statement should be reported. **20 violations.** Output below is verbatim from `sqlfluff lint` against the shipped package, manifest and config, on SQLFluff 3.4.0:
 
 ```text
 L:   3 | P:  1 | PI01 | UPDATE writes PII-tagged column(s) SSN on dbo.Customer. Compliance sign-off required.
@@ -305,7 +310,7 @@ Note the four `sp_rename` forms. `sp_rename` names its target in a string litera
 
 **This is standalone SQLFluff output, not `flyway check -code` output.** `flyway check -code` reports the same violations through its own summary table plus HTML, JSON and SARIF reports, so the presentation will differ. The violation count and the descriptions are what to compare against.
 
-`test/V002__clean.sql` — nothing should be reported. **0 violations.** The file is not a formality; every statement in it is a case that a text-matching or naive-parsing rule gets wrong:
+`code-review-rules/tests/pii/V002__clean.sql` — nothing should be reported. **0 violations.** The file is not a formality; every statement in it is a case that a text-matching or naive-parsing rule gets wrong:
 
 ```sql
 -- Writes a non-PII column, reads a PII column in the predicate only.
@@ -367,14 +372,16 @@ The shape of it, against the `check -code` JSON report:
 > Not from Redgate docs — starting point, validate in your environment.
 
 ```bash
-# Run code review over the test migrations only, into a JSON report.
-flyway check -code -reportFilename=pii-gate-check.json
+# Run code review over the known-bad test migration only, into a JSON report.
+flyway check -code -check.scope="script" -check.scriptFilename="code-review-rules/tests/pii/V001__pii_violations.sql" -reportFilename=pii-gate-check.json
 
-# The gate must still fire. Fewer than 20 means it has stopped working,
-# whatever the exit code says.
-COUNT=$(jq '[.individualResults[].results[].violations[]] | length' pii-gate-check.json)
+# The gate must still fire. Fewer than 20 PI01/PI02 violations means it has stopped
+# working, whatever the exit code says. Filter to PI01/PI02 specifically rather than
+# counting every violation in the report - other active rules (RG01, RG09, etc.) also
+# fire on this file, and a change in their count shouldn't mask a PII rule regressing.
+COUNT=$(jq '[.individualResults[].results[].violations[] | select(.rule.code == "PI01" or .rule.code == "PI02")] | length' pii-gate-check.json)
 if [ "$COUNT" -lt 20 ]; then
-  echo "PII gate reported $COUNT violations on the test migrations, expected 20."
+  echo "PII gate reported $COUNT PI01/PI02 violations on the test migration, expected 20."
   echo "The gate is not firing. Do not rely on code review until this is fixed."
   exit 1
 fi
@@ -434,11 +441,12 @@ A pre-commit hook running `flyway check -code` locally gives developers the same
 
 ## 10. Keeping central control
 
-Across multiple product lines the ruleset needs to be one thing rather than one per team:
+Across multiple product lines the ruleset needs to be one thing rather than one per team — and this package is deliberately self-contained (rules, config, docs, tests all under `code-review-rules/`) so it can be moved wholesale rather than assembled per repository:
 
-- Keep `code-review-rules/` and `sqlfluff.cfg` in a separate repository with restricted write access, and pull it into each product repository as a submodule.
-- Point `check.rulesConfig` at the committed `sqlfluff.cfg` explicitly, so a local `.sqlfluff` file in a product repository cannot override the severity of the PII rules. Without this, a team can turn the gate off locally and the pipeline will not notice.
-- Generate the manifest once, centrally, from the metadata layer, and publish it to each repository. Do not let each team maintain its own copy.
+- Put `code-review-rules/` in its own repository with restricted write access, and pull it into each product repository as a **git submodule pinned to a specific tag or commit** — never a floating branch. A developer in a product repository then gets a read-only checkout at whatever the pin says; changing the ruleset means a pull request against the central repo followed by a deliberate pin bump in each product repository, not an edit anyone can make by accident. (If your team isn't submodule-fluent, a pipeline step that clones the rules repo at a pinned tag before `check -code` runs is an equally valid alternative — more moving parts in CI, no git-submodule learning curve.)
+- Point `check.rulesConfig` at the submodule's committed `code-review-rules/sqlfluff.cfg` explicitly, so a local `.sqlfluff` file in a product repository cannot override the severity of the PII rules. Without this, a team can turn the gate off locally and the pipeline will not notice.
+- Generate each concern's manifest once, centrally, from the metadata layer that classifies it, and publish it into the shared repository rather than letting each product team maintain its own copy.
+- As more compliance concerns get added over time (see `code-review-rules/README.md` for the checklist), they all ship through the same pinned submodule — a product repository picks up a new rule module the same way it picks up a manifest update, by bumping the pin.
 
 Code review policies are also configurable in the Flyway Desktop UI, on a Code Review Policies tab in project settings, if a team would rather not hand-edit config.
 
@@ -498,7 +506,7 @@ For state-based projects, and for the view and dynamic SQL gaps in section 12, t
 
 Run `flyway check -dryrun` against the target to produce the SQL that will actually execute there, then apply the PII check to that SQL before the release is allowed to promote to the next ring. The gate sees generated SQL nobody typed, and it sees it per target, which matters when rings sit at different schema versions.
 
-**Scope this honestly before committing to it.** The dry run report's JSON carries the deployment SQL as a string, not an itemized inventory of the objects being changed. So the gate has to parse that SQL itself. The good news is that the parsing is already written — the same `rules.py` in this package can be run against the dry-run SQL by pointing standalone SQLFluff at it, rather than reimplementing the matching logic. The work is in the pipeline plumbing, not the analysis. Treat it as a real project rather than a configuration change.
+**Scope this honestly before committing to it.** The dry run report's JSON carries the deployment SQL as a string, not an itemized inventory of the objects being changed. So the gate has to parse that SQL itself. The good news is that the parsing is already written — the same `rules/` modules in this package can be run against the dry-run SQL by pointing standalone SQLFluff at it, rather than reimplementing the matching logic. The work is in the pipeline plumbing, not the analysis. Treat it as a real project rather than a configuration change.
 
 Three reasons to build it second. It needs a connection to each target, which is a larger access conversation than a lint step. It reports late, when the change is already through review, so it is a backstop rather than a feedback loop. And it only earns its cost once the author-loop gate is running and trusted.
 
@@ -531,7 +539,7 @@ Check this on every build agent before planning a rollout, and check it first on
 
 The Flyway CLI bundles **SQLFluff 3.4.2**, published on the rules library page as "SqlFluff version 3.4.2 (Redgate Bundle)". The rules in this package were verified on 3.4.2 and on 4.3.0, so the plugin API question that would otherwise be the first risk is already answered.
 
-The first thing to run is still the test pair: drop the package in, run `flyway check -code` against `test/`, and confirm 20 violations on `V001` and 0 on `V002`. If a future Flyway release moves to a SQLFluff major version that relocates `BaseRule`, `LintResult` or `SegmentSeekerCrawler`, Flyway reports a plugin load error naming the exception and the fix is a one-line import change at the top of `rules.py`.
+The first thing to run is still the test pair: drop the package in, run `flyway check -code -check.scope="script" -check.scriptFilename="..."` against each file in `code-review-rules/tests/pii/`, and confirm 20 `PI01`/`PI02` violations on `V001` and 0 on `V002`. If a future Flyway release moves to a SQLFluff major version that relocates `BaseRule`, `LintResult` or `SegmentSeekerCrawler`, Flyway reports a plugin load error naming the exception and the fix is a one-line import change at the top of `rules/_shared.py`.
 
 ## Reference
 

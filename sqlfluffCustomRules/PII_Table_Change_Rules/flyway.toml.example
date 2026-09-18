@@ -2,7 +2,7 @@
 
 [flyway.check]
 sqlfluffCustomRulesPath = "code-review-rules"
-rulesConfig = "sqlfluff.cfg"
+rulesConfig = "code-review-rules/sqlfluff.cfg"
 
 [flyway.check.code]
 # Phase 1: report, do not fail the build.
