@@ -1,0 +1,11 @@
+# Fragment to merge into the project's existing flyway.toml.
+
+[flyway.check]
+sqlfluffCustomRulesPath = "code-review-rules"
+rulesConfig = "sqlfluff.cfg"
+
+[flyway.check.code]
+# Phase 1: report, do not fail the build.
+failOnError = false
+# A developer's "-- noqa" suppression still shows up in the report.
+noqaSeverity = "ERROR"
